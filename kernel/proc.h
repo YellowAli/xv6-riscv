@@ -24,6 +24,12 @@ struct cpu {
   struct context context;     // swtch() here to enter scheduler().
   int noff;                   // Depth of push_off() nesting.
   int intena;                 // Were interrupts enabled before push_off()?
+
+  // Halt-on-Idle tracking (Feature 4)
+  uint64 idle_ticks;          // total ticks spent in WFI idle
+  uint64 total_ticks;         // total scheduler loop iterations
+  uint64 wfi_count;           // number of times WFI was entered
+  uint64 last_idle_start;     // timestamp when WFI was entered (for measuring duration)
 };
 
 extern struct cpu cpus[NCPU];
@@ -91,6 +97,13 @@ struct proc {
   int killed;                  // If non-zero, have been killed
   int xstate;                  // Exit status to be returned to parent's wait
   int pid;                     // Process ID
+  int estimatedBurstTime;      // Estimated burst time for SJF scheduling
+  int tickCount;               // Number of ticks the process has been running for
+  int lastBurstTime;           // Last burst time for SJF scheduling
+  int waitTicks;               // Ticks spent waiting in RUNNABLE state (for aging)
+  int energy_budget;           // Remaining budget (ticks) in current reset window
+  int energy_used;             // Ticks consumed in current reset window
+  uint energy_window;          // Last observed global reset window index
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
@@ -104,4 +117,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
 };

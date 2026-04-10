@@ -5,12 +5,13 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "powerstate.h"  // Feature 2: CPU Power States
 
-struct cpu cpus[NCPU];
+struct cpu cpus[NCPU]; //array of CPU structures, one per CPU
 
-struct proc proc[NPROC];
+struct proc proc[NPROC]; //array of process structures, one per process
 
-struct proc *initproc;
+struct proc *initproc; //pointer to the initial process, which will be the ancestor of all other processes
 
 int nextpid = 1;
 struct spinlock pid_lock;
@@ -25,6 +26,34 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+#define ENERGY_EXHAUST_PENALTY 4
+
+static uint
+energy_window_for_tick(uint now_ticks)
+{
+  return now_ticks / ENERGY_BUDGET_RESET_TICKS;
+}
+
+void
+proc_energy_refresh(struct proc *p, uint now_ticks)
+{
+  uint window = energy_window_for_tick(now_ticks);
+  if(p->energy_window != window){
+    p->energy_window = window;
+    p->energy_budget = ENERGY_BUDGET_DEFAULT;
+    p->energy_used = 0;
+  }
+}
+
+void
+proc_energy_on_tick(struct proc *p)
+{
+  proc_energy_refresh(p, ticks);
+  if(p->energy_budget > 0)
+    p->energy_budget--;
+  p->energy_used++;
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -111,6 +140,8 @@ allocproc(void)
 {
   struct proc *p;
 
+  // Find an UNUSED process.
+  // Iterate through the process table, starting at first index of the proc array, and looking for a process whose state is UNUSED. If such a process is found, acquire its lock and return it with the lock held. If no UNUSED process is found, return 0.
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
@@ -124,8 +155,20 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->estimatedBurstTime = TIMESLICE;
+  p->tickCount = 0;
+  p->lastBurstTime = 0;
+  p->waitTicks = 0;
+  p->energy_budget = ENERGY_BUDGET_DEFAULT;
+  p->energy_used = 0;
+  p->energy_window = energy_window_for_tick(ticks);
+
+   // Allocate a trapframe page.
 
   // Allocate a trapframe page.
+  // This is basically a page of memory that will be used to store the process's trapframe
+  // A trapframe is a data structure that holds the process's register state when it is interrupted or makes a system call. 
+  // The trapframe page is allocated using kalloc(), and if the allocation fails, the process is freed and 0 is returned.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
     release(&p->lock);
@@ -133,6 +176,11 @@ found:
   }
 
   // An empty user page table.
+  // This is the page table that will be used to manage the process's virtual memory. 
+  // It is created using the proc_pagetable() function, 
+  // which sets up a new page table with no user memory but with trampoline and trapframe pages. 
+  // If the page table creation fails, the process is freed and 0 is returned.
+  // A pagetable is a data structure that maps virtual addresses to physical addresses, and it is used by the CPU to translate virtual memory accesses into physical memory accesses.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
@@ -168,6 +216,9 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->energy_budget = 0;
+  p->energy_used = 0;
+  p->energy_window = 0;
   p->state = UNUSED;
 }
 
@@ -221,12 +272,12 @@ userinit(void)
 {
   struct proc *p;
 
-  p = allocproc();
+  p = allocproc(); //find the first unused process point to it
   initproc = p;
   
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
+  p->state = RUNNABLE; // set that process to be runnable, so that it can be scheduled to run by the scheduler
 
   release(&p->lock);
 }
@@ -267,6 +318,9 @@ kfork(void)
   if((np = allocproc()) == 0){
     return -1;
   }
+
+  // Inherit burst estimate from parent so the child starts with an accurate prediction.
+  np->estimatedBurstTime = p->estimatedBurstTime;
 
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
@@ -425,10 +479,12 @@ void
 scheduler(void)
 {
   struct proc *p;
-  struct cpu *c = mycpu();
+  struct cpu *c = mycpu(); //now I have a pointer to the cpu struct for the current CPU, which I can use to keep track of which process is currently running on this CPU. 
 
-  c->proc = 0;
-  for(;;){
+  c->proc = 0; //set the proc field of the cpu struct to 0, indicating that there is no process currently running on this CPU.
+  for(;;){ 
+    //this is an infinite loop that will keep the scheduler running indefinitely, allowing it to continuously schedule processes as needed. | It technically doesn't keep running it just runs when the CPU is idle, but it will keep running until the system is shut down or restarted.
+    
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
     // processes are waiting. Then turn them back off
@@ -437,28 +493,96 @@ scheduler(void)
     intr_on();
     intr_off();
 
+    // Track total scheduler iterations for idle percentage calculation
+    c->total_ticks++;
+
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
+    int minScore = __INT_MAX__;
+    int maxBudget = -1;
+    struct proc *selectedProc = 0;
+    uint now_ticks = ticks;
+    int runnable_count = 0;
+    for(p = proc; p < &proc[NPROC]; p++) { 
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
+        runnable_count++;
+        proc_energy_refresh(p, now_ticks);
+
+        // Age the process: the longer it waits, the lower its effective burst.
+        p->waitTicks++;
+        int effectiveBurst = p->estimatedBurstTime - p->waitTicks / AGING_FACTOR;
+        if(effectiveBurst < 0) effectiveBurst = 0;
+
+        int score = effectiveBurst;
+        if(p->energy_budget <= 0)
+          score += ENERGY_EXHAUST_PENALTY;
+
+        if(score < minScore || (score == minScore && p->energy_budget > maxBudget)) {
+          minScore = score;
+          maxBudget = p->energy_budget;
+          selectedProc = p;
+          found = 1;
+        }
+      }
+      release(&p->lock);
+    }
+
+    // Log SJF decision once per tick per CPU when there is real contention.
+    static uint sjf_last_log[NCPU] = {0};
+    int cid = cpuid();
+    if(found && runnable_count > 1 && now_ticks != sjf_last_log[cid]) {
+      sjf_last_log[cid] = now_ticks;
+      printf("[sjf t%d cpu%d] picked %s(est=%d)  %d other(s) deferred\n",
+             now_ticks, cid, selectedProc->name,
+             selectedProc->estimatedBurstTime, runnable_count - 1);
+    }
+
+    if(found == 1){
+      acquire(&selectedProc->lock);
+      if(selectedProc->state == RUNNABLE){
+        selectedProc->waitTicks = 0;  // reset aging counter on dispatch
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+        selectedProc->state = RUNNING;
+        c->proc = selectedProc;
+        swtch(&c->context, &selectedProc->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
-        found = 1;
       }
-      release(&p->lock);
+      release(&selectedProc->lock);
     }
     if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
+      // Nothing to run — enter low-power idle state.
+      // Record the timestamp before halting so we can measure
+      // how long the CPU actually slept.
+      c->wfi_count++;
+      c->last_idle_start = r_time();
+
+      // WFI: CPU halts until next interrupt (timer, I/O, etc.)
+      // This saves energy compared to busy-waiting in a tight loop.
+      wfi();
+
+      // Woke up from WFI — compute how many ticks we were idle
+      uint64 idle_end = r_time();
+      if(c->last_idle_start > 0) {
+        c->idle_ticks += (idle_end - c->last_idle_start);
+      }
     }
+  }
+}
+
+// Aggregate idle statistics across all CPUs.
+// Writes results into the provided arrays (must have NCPU entries).
+void
+get_idle_ticks(uint64 *idle, uint64 *total, uint64 *wfi_counts)
+{
+  for(int i = 0; i < NCPU; i++){
+    idle[i] = cpus[i].idle_ticks;
+    total[i] = cpus[i].total_ticks;
+    wfi_counts[i] = cpus[i].wfi_count;
   }
 }
 
@@ -484,6 +608,10 @@ sched(void)
   if(intr_get())
     panic("sched interruptible");
 
+  p->lastBurstTime = p->tickCount;
+  p->tickCount = 0; // reset the tick count for the process when it is scheduled, so that it can start counting ticks from 0 again when it runs next time.
+  p->estimatedBurstTime = (p->lastBurstTime + p->estimatedBurstTime) / 2; // update the estimated burst time for the process using an exponential moving average, where the new estimated burst time is a weighted average of the last burst time and the previous estimated burst time. This allows the scheduler to make more informed decisions about which process to schedule next based on their expected CPU usage.
+  
   intena = mycpu()->intena;
   swtch(&p->context, &mycpu()->context);
   mycpu()->intena = intena;

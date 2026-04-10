@@ -101,6 +101,9 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+void            get_idle_ticks(uint64*, uint64*, uint64*);
+void            proc_energy_refresh(struct proc*, uint);
+void            proc_energy_on_tick(struct proc*);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -180,6 +183,12 @@ void            plic_complete(int);
 void            virtio_disk_init(void);
 void            virtio_disk_rw(struct buf *, int);
 void            virtio_disk_intr(void);
+
+// powerstate.c  -- Feature 2: CPU Power States (Dynamic Timeslice Scaling)
+int             count_runnable_procs(void);
+void            update_power_state(void);
+int             get_timeslice_for_state(void);
+char*           power_state_name(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
